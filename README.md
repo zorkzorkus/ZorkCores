@@ -8,3 +8,6 @@ Collection of IP cores mostly for Intel FPGAs i.e. connected to avalon bus and a
 ## Soon Available
 * AvalonUart (UART core with limited functionality but using FIFO)
 * RiscvCores
+
+## Also planned
+* (SDRAM) Avalon Memory Arbiter
