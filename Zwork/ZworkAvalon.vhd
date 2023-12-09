@@ -2,10 +2,13 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+-- TOP LEVEL FILE
+-- for Avalon/Qsys Component
+
 entity ZworkAvalon is
 	generic (
-		g_reset_vector : std_logic_vector(31 downto 0) := x"00000010";
-		g_mtvec        : std_logic_vector(31 downto 0) := x"00000020"
+		g_reset_vector : std_logic_vector(31 downto 0) := x"00000004";
+		g_mtvec        : std_logic_vector(31 downto 0) := x"00000008"
 	);
 	port (
 		clk               : in  std_logic;
@@ -35,8 +38,8 @@ architecture rtl of ZworkAvalon is
 
 	component ZworkCore is
 		generic (
-			g_reset_vector : std_logic_vector(31 downto 0) := x"00000010";
-			g_mtvec        : std_logic_vector(31 downto 0) := x"00000020"
+			g_reset_vector : std_logic_vector(31 downto 0) := x"00000004";
+			g_mtvec        : std_logic_vector(31 downto 0) := x"00000008"
 		);
 		port (
 			clk       : in  std_logic;
@@ -54,7 +57,7 @@ architecture rtl of ZworkAvalon is
 
 begin
 
-	u0: component ZworkCore
+	com_zworkcore: component ZworkCore
 		generic map (
 			g_reset_vector => g_reset_vector,
 			g_mtvec        => g_mtvec
@@ -88,7 +91,7 @@ begin
 		s_wdata(7 downto 0) & x"000000";
 
 	s_rdata <= mm_rdata when a_addroff = "00" else
-		x"00" & mm_rdata(31 downto  8) when a_addroff ="01" else
+		x"00" & mm_rdata(31 downto 8) when a_addroff ="01" else
 		x"0000" & mm_rdata(31 downto 16) when a_addroff ="10" else
 		x"000000" & mm_rdata(31 downto 24);
 

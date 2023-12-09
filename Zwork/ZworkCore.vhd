@@ -6,710 +6,432 @@ use work.ZworkUtil.all;
 
 entity ZworkCore is
 	generic (
-		g_reset_vector : std_logic_vector(31 downto 0) := x"00000010";
-		g_mtvec        : std_logic_vector(31 downto 0) := x"00000020"
+		g_reset_vector : std_logic_vector(31 downto 0) := x"00000004";
+		g_mtvec        : std_logic_vector(31 downto 0) := x"00000008"
 	);
 	port (
-		clk       : in  std_logic;
-		resetn    : in  std_logic;
-		bus_ack   : in  std_logic;
-		bus_rdata : in  std_logic_vector(31 downto 0);
-		bus_act   : out std_logic;
-		bus_wnr   : out std_logic;
-		bus_byten : out std_logic_vector( 3 downto 0);
-		bus_addr  : out std_logic_vector(31 downto 0);
-		bus_wdata : out std_logic_vector(31 downto 0);
-		interrupt : in  std_logic_vector(31 downto 0)
+		clk        : in  std_logic;
+		resetn     : in  std_logic;
+		bus_act    : out std_logic;
+		bus_ack    : in  std_logic;
+		bus_wnr    : out std_logic;
+		bus_byten  : out std_logic_vector(3 downto 0);
+		bus_addr   : out std_logic_vector(31 downto 0);
+		bus_wdata  : out std_logic_vector(31 downto 0);
+		bus_rdata  : in  std_logic_vector(31 downto 0);
+		interrupt  : in  std_logic_vector(31 downto 0)
 	);
 end entity;
 
--- Core can be interrupted if:
-	-- Global interrupt (MIE) ist set in rcsr_mstatus(0) [equals mstatus(3)]
-	-- Interrupt Type is enabled (rcsr_mie(2 downto 0))
--- When core is interrupted
-	-- MIE is copied to MPIE (rcsr_mstatus(1))
-	-- mepc <= pc
-	-- pc <= mtvec
-	-- etc.
--- When MRET is executed
-	-- MPIE is copied back to MIE and MPIE set to 0
-	-- pc <= mepc
-
 architecture rtl of ZworkCore is
 
-	signal r_state : e_State := State_FetchWriteback;
-	signal r_pc : unsigned(31 downto 0) := unsigned(g_reset_vector);
 
-	signal r_funct3 : std_logic_vector(2 downto 0);
-	signal r_op1    : std_logic_vector(31 downto 0);
-	signal r_op2    : std_logic_vector(31 downto 0);
-	signal r_op3    : std_logic_vector(31 downto 0);
-	signal r_csrval : std_logic_vector(31 downto 0);
-	signal r_csrres : std_logic_vector(31 downto 0);
-	signal r_rd     : unsigned(4 downto 0) := (others => '0');
-	signal r_op     : e_Opcode;
-	signal r_reg1   : boolean;
-	signal r_reg2   : boolean;
-	signal r_res    : std_logic_vector(31 downto 0);
-	signal r_csr    : e_Csr;
-	signal r_csrpen : boolean := false;
-	signal r_multi  : boolean := false;
-	signal r_mulss  : std_logic_vector(63 downto 0);
-	signal r_mulsu  : std_logic_vector(65 downto 0);
-	signal r_muluu  : std_logic_vector(63 downto 0);
+	signal r_state   : e_State := State_FetchWriteback;
 
-	signal c_op1     : std_logic_vector(31 downto 0);
-	signal c_op2     : std_logic_vector(31 downto 0);
-	signal c_timer   : boolean;
-	signal c_memaddr : std_logic_vector(31 downto 0);
+	signal c_res : std_logic_vector(31 downto 0);
+	signal c_memact : boolean;
+	signal c_regwrite : boolean;
+	signal c_fchactive : boolean;
+	signal c_decactive : boolean;
+	signal c_exeactive : boolean;
+	signal c_trap : boolean;
+	signal c_busaddr : std_logic_vector(31 downto 0);
 
-	signal reg_addr1 : unsigned(4 downto 0);
-	signal reg_addr2 : unsigned(4 downto 0);
-	signal reg_wren1 : std_logic;
-	signal reg_dati1 : std_logic_vector(31 downto 0);
-	signal reg_dato1 : std_logic_vector(31 downto 0);
-	signal reg_dato2 : std_logic_vector(31 downto 0);
+	-- driver for s_signal is in another ~castle~ module
+	signal s_op      : e_Opcode;
+	signal s_type    : e_Type;
+	signal s_imm     : std_logic_vector(31 downto 0);
+	signal s_csrimm  : std_logic_vector(4 downto 0);
+	signal s_rd      : std_logic_vector(4 downto 0);
+	signal s_rs1data : std_logic_vector(31 downto 0);
+	signal s_rs2data : std_logic_vector(31 downto 0);
+	signal s_rs1reg  : std_logic_vector(4 downto 0);
+	signal s_rs2reg  : std_logic_vector(4 downto 0);
+	signal s_funct3  : std_logic_vector(2 downto 0);
+	signal s_funct7  : std_logic_vector(6 downto 0);
+	signal s_pc      : std_logic_vector(31 downto 0);
+	signal s_pcnext  : std_logic_vector(31 downto 0);
+	signal s_alures  : std_logic_vector(31 downto 0);
+	signal s_aluwait : boolean;
+	signal s_memdone : boolean;
+	signal s_memres  : std_logic_vector(31 downto 0);
+	signal s_csr     : e_Csr;
+	signal s_csrres  : std_logic_vector(31 downto 0);
+	signal s_mem_wdata : std_logic_vector(31 downto 0);
+	signal s_mem_addr  : std_logic_vector(31 downto 0);
+	signal s_mem_byten : std_logic_vector(3 downto 0);
+	signal s_mem_wnr   : std_logic;
+	signal s_csr_mtvec : std_logic_vector(31 downto 0);
+	signal s_csr_mepc  : std_logic_vector(31 downto 0);
+	signal s_trp_instalign  : boolean;
+	signal s_trp_instaccess : boolean;
+	signal s_trp_badinstr   : boolean;
+	signal s_trp_loadalign  : boolean;
+	signal s_trp_loadaccess : boolean;
+	signal s_trp_storealign : boolean;
+	signal s_trp_storeacess : boolean;
+	signal s_trp_ecall      : boolean;
+	signal s_trp_irqext     : boolean;
+	signal s_trp_irqsoft    : boolean;
+	signal s_trp_irqtimer   : boolean;
+	signal s_interrupts     : std_logic_vector(2 downto 0);
 
-	signal div_result : std_logic_vector(31 downto 0);
-	signal div_done   : boolean;
-	signal div_start  : boolean := false;
+	signal r_instr   : std_logic_vector(31 downto 0) := (others => '0');
 
-	signal rcsr_mtvec   : std_logic_vector(31 downto 0) := g_mtvec;
-	signal rcsr_mcause  : std_logic_vector(4 downto 0);
-	signal rcsr_mepc    : std_logic_vector(31 downto 0);
-	signal rcsr_time    : std_logic_vector(63 downto 0) := (others => '0');
-	signal rcsr_instret : std_logic_vector(63 downto 0) := (others => '0');
-	signal rcsr_mtval   : std_logic_vector(31 downto 0);
-	signal rcsr_mie     : std_logic_vector(2 downto 0) := "000";
-	signal rcsr_mip     : std_logic_vector(2 downto 0) := "000";
-	signal rcsr_mstatus : std_logic_vector(1 downto 0);
-	signal rcsr_irqen   : std_logic_vector(31 downto 0);
-	signal rcsr_irqpen  : std_logic_vector(31 downto 0);
-	signal rcsr_timecmp : std_logic_vector(63 downto 0);
-
-	component ZworkRegister is
+	component ZworkAlu is
 		port (
-			clk      : in std_logic;
-			i_addr_a : in unsigned(4 downto 0);
-			i_addr_b : in unsigned(4 downto 0);
-			i_dati_a : in std_logic_vector(31 downto 0);
-			i_wren_a : in std_logic := '1';
-			i_dato_a : out std_logic_vector(31 downto 0);
-			i_dato_b : out std_logic_vector(31 downto 0)
+			clk    : in  std_logic;
+			resetn : in  std_logic;
+			i_op   : in  e_Opcode;
+			i_rs1  : in  std_logic_vector(31 downto 0);
+			i_rs2  : in  std_logic_vector(31 downto 0);
+			i_imm  : in  std_logic_vector(31 downto 0);
+			i_pc   : in  std_logic_vector(31 downto 0);
+			i_act  : in  boolean;
+			o_res  : out std_logic_vector(31 downto 0);
+			o_wait : out boolean
 		);
 	end component;
 
-	component ZworkDivider is
+	component ZworkBranch is
+		generic (
+			g_reset_vector : std_logic_vector(31 downto 0) := x"00000004"
+		);
+		port (
+			clk        : in  std_logic;
+			resetn     : in  std_logic;
+			i_active   : in  boolean;
+			i_op       : in  e_Opcode;
+			i_mepc     : in  std_logic_vector(31 downto 0);
+			i_imm      : in  std_logic_vector(31 downto 0);
+			i_rs1      : in  std_logic_vector(31 downto 0);
+			i_rs2      : in  std_logic_vector(31 downto 0);
+			i_pc       : in  std_logic_vector(31 downto 0);
+			o_pc       : out std_logic_vector(31 downto 0)
+		);
+	end component;
+
+	component ZworkCsr is
+		generic (
+			g_mtvec : std_logic_vector(31 downto 0) := x"00000008"
+		);
+		port (
+			clk              : in  std_logic;
+			resetn           : in  std_logic;
+			i_state          : in  e_State;
+			i_csrsel         : in  e_Csr;
+			i_op             : in  e_Opcode;
+			i_pc             : in  std_logic_vector(31 downto 0);
+			i_pcnext         : in  std_logic_vector(31 downto 0);
+			i_rs1            : in  std_logic_vector(31 downto 0);
+			i_imm            : in  std_logic_vector(4 downto 0);
+			i_badaddr        : in  std_logic_vector(31 downto 0);
+			i_instr          : in  std_logic_vector(31 downto 0);
+			i_trp_instalign  : in  boolean;
+			i_trp_instaccess : in  boolean;
+			i_trp_badinstr   : in  boolean;
+			i_trp_loadalign  : in  boolean;
+			i_trp_loadaccess : in  boolean;
+			i_trp_storealign : in  boolean;
+			i_trp_storeacess : in  boolean;
+			i_trp_ecall      : in  boolean;
+			i_trp_irqsoft    : in  boolean;
+			i_trp_irqtimer   : in  boolean;
+			i_trp_irqext     : in  boolean;
+			i_interrupt      : in  std_logic_vector(31 downto 0);
+			o_interrupts     : out std_logic_vector(2 downto 0);
+			o_regres         : out std_logic_vector(31 downto 0);
+			o_csr_mtvec      : out std_logic_vector(31 downto 0);
+			o_csr_mepc       : out std_logic_vector(31 downto 0)
+		);
+	end component;
+
+	component ZworkDecoder is
+		port (
+			clk            : in  std_logic;
+			resetn         : in  std_logic;
+			i_instr        : in  std_logic_vector(31 downto 0);
+			i_active       : in  boolean;
+			o_trp_badinstr : out boolean;
+			o_trp_ecall    : out boolean;
+			o_op           : out e_Opcode;
+			o_type         : out e_Type;
+			o_rd           : out std_logic_vector(4 downto 0);
+			o_rs1          : out std_logic_vector(4 downto 0);
+			o_rs2          : out std_logic_vector(4 downto 0);
+			o_imm          : out std_logic_vector(31 downto 0);
+			o_csrimm       : out std_logic_vector(4 downto 0);
+			o_csr          : out e_Csr;
+			o_funct3       : out std_logic_vector(2 downto 0);
+			o_funct7       : out std_logic_vector(6 downto 0)
+		);
+	end component;
+
+	component ZworkFetch is
+		port (
+			clk              : in  std_logic;
+			resetn           : in  std_logic;
+			i_active         : in  boolean;
+			i_interrupts     : in  std_logic_vector(2 downto 0);
+			i_ext_irqs       : in  std_logic_vector(31 downto 0);
+			i_pc             : in  std_logic_vector(31 downto 0);
+			i_mtvec          : in  std_logic_vector(31 downto 0);
+			i_trp_badinstr   : in  boolean;
+			i_trp_ecall      : in  boolean;
+			i_trp_loadalign  : in  boolean;
+			i_trp_loadaccess : in  boolean;
+			i_trp_storealign : in  boolean;
+			i_trp_storeacess : in  boolean;
+			o_pc             : out std_logic_vector(31 downto 0);
+			o_trp_instalign  : out boolean;
+			o_trp_instaccess : out boolean;
+			o_irq_soft       : out boolean;
+			o_irq_timer      : out boolean;
+			o_irq_ext        : out boolean
+		);
+	end component;
+
+	component ZworkMemory is
+		port (
+			clk               : in  std_logic;
+			resetn            : in  std_logic;
+			i_op              : in  e_Opcode;
+			i_active          : in  boolean;
+			i_imm             : in  std_logic_vector(31 downto 0);
+			i_rs1             : in  std_logic_vector(31 downto 0);
+			i_rs2             : in  std_logic_vector(31 downto 0);
+			i_bus_ack         : in  std_logic;
+			i_bus_data        : in  std_logic_vector(31 downto 0);
+			o_bus_addr        : out std_logic_vector(31 downto 0);
+			o_bus_data        : out std_logic_vector(31 downto 0);
+			o_bus_wnr         : out std_logic;
+			o_bus_byten       : out std_logic_vector(3 downto 0);
+			o_res             : out std_logic_vector(31 downto 0);
+			o_done            : out boolean;
+			o_trp_loadalign   : out boolean;
+			o_trp_loadaccess  : out boolean;
+			o_trp_storealign  : out boolean;
+			o_trp_storeaccess : out boolean
+		);
+	end component;
+
+	component ZworkRegisters is
 		port (
 			clk      : in  std_logic;
-			dividend : in  std_logic_vector(31 downto 0);
-			divisor  : in  std_logic_vector(31 downto 0);
-			result   : out std_logic_vector(31 downto 0);
-			op       : in  e_Opcode;
-			start    : in  boolean;
-			done     : out boolean
+			resetn   : in  std_logic;
+			i_write  : in  boolean;
+			i_rs1    : in  std_logic_vector(4 downto 0);
+			i_rs2    : in  std_logic_vector(4 downto 0);
+			i_rd     : in  std_logic_vector(4 downto 0);
+			i_result : in  std_logic_vector(31 downto 0);
+			o_reg1   : out std_logic_vector(31 downto 0);
+			o_reg2   : out std_logic_vector(31 downto 0)
 		);
 	end component;
-	
 
 begin
 
-	com_registers: ZworkRegister
+	com_zworkalu: ZworkAlu
 		port map (
-			clk      => clk,
-			i_addr_a => reg_addr1,
-			i_addr_b => reg_addr2,
-			i_dati_a => reg_dati1,
-			i_wren_a => reg_wren1,
-			i_dato_a => reg_dato1,
-			i_dato_b => reg_dato2
+			clk    => clk,
+			resetn => resetn,
+			i_op   => s_op,
+			i_rs1  => s_rs1data,
+			i_rs2  => s_rs2data,
+			i_imm  => s_imm,
+			i_pc   => s_pc,
+			i_act  => c_exeactive,
+			o_res  => s_alures,
+			o_wait => s_aluwait
 		);
 
-	com_divider: ZworkDivider
+	com_zworkbranch: ZworkBranch
+		generic map (
+			g_reset_vector => g_reset_vector
+		)
 		port map (
-			clk      => clk,
-			dividend => reg_dato1,
-			divisor  => reg_dato2,
-			result   => div_result,
-			op       => r_op,
-			start    => div_start,
-			done     => div_done
+			clk        => clk,
+			resetn     => resetn,
+			i_active   => c_exeactive,
+			i_op       => s_op,
+			i_mepc     => s_csr_mepc,
+			i_imm      => s_imm,
+			i_rs1      => s_rs1data,
+			i_rs2      => s_rs2data,
+			i_pc       => s_pc,
+			o_pc       => s_pcnext
 		);
 
-	process (clk, resetn)
-		-- "va" means its a "variable" but used just as an "alias"
-		variable va_immi   : std_logic_vector(31 downto 0);
-		variable va_imms   : std_logic_vector(31 downto 0);
-		variable va_immb   : std_logic_vector(31 downto 0);
-		variable va_immu   : std_logic_vector(31 downto 0);
-		variable va_immj   : std_logic_vector(31 downto 0);
-		variable va_funct3 : std_logic_vector(2 downto 0);
-		variable va_funct7 : std_logic_vector(6 downto 0);
-		variable va_inst62 : std_logic_vector(4 downto 0);
-	begin
+	com_zworkcsr: ZworkCsr
+		generic map (
+			g_mtvec => g_mtvec
+		)
+		port map (
+			clk              => clk,
+			resetn           => resetn,
+			i_state          => r_state,
+			i_csrsel         => s_csr,
+			i_op             => s_op,
+			i_pc             => s_pc,
+			i_pcnext         => s_pcnext,
+			i_rs1            => s_rs1data,
+			i_imm            => s_csrimm,
+			i_badaddr        => c_busaddr, -- TODO: this signal is VERY LIKELY WRONG
+			i_instr          => r_instr,
+			i_trp_instalign  => s_trp_instalign,
+			i_trp_instaccess => s_trp_instaccess,
+			i_trp_badinstr   => s_trp_badinstr,
+			i_trp_loadalign  => s_trp_loadalign,
+			i_trp_loadaccess => s_trp_loadaccess,
+			i_trp_storealign => s_trp_storealign,
+			i_trp_storeacess => s_trp_storeacess,
+			i_trp_ecall      => s_trp_ecall,
+			i_trp_irqsoft    => s_trp_irqsoft,
+			i_trp_irqtimer   => s_trp_irqtimer,
+			i_trp_irqext     => s_trp_irqext,
+			i_interrupt      => interrupt,
+			o_interrupts     => s_interrupts,
+			o_regres         => s_csrres,
+			o_csr_mtvec      => s_csr_mtvec,
+			o_csr_mepc       => s_csr_mepc
+		);
+
+	com_zworkdecoder: ZworkDecoder
+		port map (
+			clk            => clk,
+			resetn         => resetn,
+			i_instr        => bus_rdata,
+			i_active       => c_decactive,
+			o_trp_badinstr => s_trp_badinstr,
+			o_trp_ecall    => s_trp_ecall,
+			o_op           => s_op,
+			o_type         => s_type,
+			o_rd           => s_rd,
+			o_rs1          => s_rs1reg,
+			o_rs2          => s_rs2reg,
+			o_imm          => s_imm,
+			o_csrimm       => s_csrimm,
+			o_csr          => s_csr,
+			o_funct3       => s_funct3,
+			o_funct7       => s_funct7
+		);
+
+	com_zworkfetch: ZworkFetch
+		port map (
+			clk              => clk,
+			resetn           => resetn,
+			i_active         => c_fchactive,
+			i_interrupts     => s_interrupts,
+			i_ext_irqs       => interrupt,
+			i_pc             => s_pcnext,
+			i_mtvec          => s_csr_mtvec,
+			i_trp_badinstr   => s_trp_badinstr,
+			i_trp_ecall      => s_trp_ecall,
+			i_trp_loadalign  => s_trp_loadalign,
+			i_trp_loadaccess => s_trp_loadaccess,
+			i_trp_storealign => s_trp_storealign,
+			i_trp_storeacess => s_trp_storeacess,
+			o_pc             => s_pc,
+			o_trp_instalign  => s_trp_instalign,
+			o_trp_instaccess => s_trp_instaccess,
+			o_irq_soft       => s_trp_irqsoft,
+			o_irq_timer      => s_trp_irqtimer,
+			o_irq_ext        => s_trp_irqext
+		);
+
+	com_zworkmemory: ZworkMemory
+		port map (
+			clk               => clk,
+			resetn            => resetn,
+			i_op              => s_op,
+			i_active          => c_exeactive,
+			i_imm             => s_imm,
+			i_rs1             => s_rs1data,
+			i_rs2             => s_rs2data,
+			i_bus_ack         => bus_ack,
+			i_bus_data        => bus_rdata,
+			o_bus_addr        => s_mem_addr,
+			o_bus_data        => s_mem_wdata,
+			o_bus_wnr         => s_mem_wnr,
+			o_bus_byten       => s_mem_byten,
+			o_res             => s_memres,
+			o_done            => s_memdone,
+			o_trp_loadalign   => s_trp_loadalign,
+			o_trp_loadaccess  => s_trp_loadaccess,
+			o_trp_storealign  => s_trp_storealign,
+			o_trp_storeaccess => s_trp_storeacess
+		);
+
+	com_zworkregisters: ZworkRegisters
+		port map (
+			clk      => clk,
+			resetn   => resetn,
+			i_write  => c_regwrite,
+			i_rs1    => s_rs1reg,
+			i_rs2    => s_rs2reg,
+			i_rd     => s_rd,
+			i_result => c_res,
+			o_reg1   => s_rs1data,
+			o_reg2   => s_rs2data
+		);
+
+	process (clk, resetn) begin
 		if (resetn = '0') then
-			r_pc <= unsigned(g_reset_vector);
 			r_state <= State_FetchWriteback;
-			r_rd <= "00000";
-			bus_act <= '0';
-		elsif (rising_edge(clk)) then
-
-			-- Prepare aliases
-			va_immi := (others => bus_rdata(31));
-			va_immi(10 downto 0) := bus_rdata(30 downto 20);
-			va_imms := (others => bus_rdata(31));
-			va_imms(10 downto 0) := bus_rdata(30 downto 25) & bus_rdata(11 downto 7);
-			va_immb := (others => bus_rdata(31));
-			va_immb(11 downto 0) := bus_rdata(7) & bus_rdata(30 downto 25) & bus_rdata(11 downto 8) & "0";
-			va_immu := bus_rdata(31 downto 12) & x"000";
-			va_immj := (others => bus_rdata(31));
-			va_immj(19 downto 0) := bus_rdata(19 downto 12) & bus_rdata(20) & bus_rdata(30 downto 21) & "0";
-			va_funct3 := bus_rdata(14 downto 12);
-			va_funct7 := bus_rdata(31 downto 25);
-			va_inst62 := bus_rdata(6 downto 2);
-
-			-- Default Assignments
-			reg_wren1 <= '0';
-
-			-- Every Clock
-			rcsr_time <= std_logic_vector(unsigned(rcsr_time) + 1);
-			rcsr_irqpen <= interrupt;
-			if ((interrupt and rcsr_irqen) /= x"00000000") then
-				rcsr_mip(2) <= '1';
-			else 
-				rcsr_mip(2) <= '0';
-			end if;
-			if (unsigned(rcsr_time) >= unsigned(rcsr_timecmp)) then
-				rcsr_mip(1) <= '1';
+		elsif rising_edge(clk) then
+			if (c_trap) then
+				-- In case of a trap, the next clock will already have the mtvec on the fetch addr
+				-- So we can jump directly to decode and wait for ack
+				r_state <= State_Decode;
 			else
-				rcsr_mip(1) <= '0';
-			end if;
-
-			-- Core
-			if (r_state = State_FetchWriteback) then
-
-				-- Writeback
-				if (r_rd /= 0) then
-					reg_wren1 <= '1';
-				end if;
-				rcsr_instret <= std_logic_vector(unsigned(rcsr_instret) + 1);
-
-				-- Writeback CSRs
-				if (r_csrpen) then
-					r_csrpen <= false;
-					case r_csr is
-						when Csr_Mtvec => rcsr_mtvec <= r_csrres;
-						when Csr_Mepc => rcsr_mepc <= r_csrres;
-						when Csr_Mie =>
-							rcsr_mie(2) <= r_csrres(11);
-							rcsr_mie(1) <= r_csrres(7);
-							rcsr_mie(0) <= r_csrres(3);
-						when Csr_Mip => rcsr_mip(0) <= r_csrres(3);
-						when Csr_Mstatus =>
-							rcsr_mstatus(1) <= r_csrres(7);
-							rcsr_mstatus(0) <= r_csrres(3);
-						when Csr_Irqen => rcsr_irqen <= r_csrres;
-						when Csr_Timecmp => rcsr_timecmp(31 downto 0) <= r_csrres;
-						when Csr_Timecmph => rcsr_timecmp(63 downto 32) <= r_csrres;
-						when others => null;
-					end case;
-				end if;
-
-				-- Fetch
-				if (r_pc = x"00000000") then
-					r_state <= State_Trap;
-					rcsr_mcause <= "00001";
-				elsif (r_pc(1 downto 0) /= "00") then
-					r_state <= State_Trap;
-					rcsr_mcause <= "00000";
-				elsif (rcsr_mstatus(0) = '1' and (rcsr_mie(1) and rcsr_mip(1)) = '1') then
-					r_state <= State_Trap;
-					rcsr_mcause <= "10111";
-				elsif (rcsr_mstatus(0) = '1' and (rcsr_mie(2) and rcsr_mip(2)) = '1') then
-					r_state <= State_Trap;
-					rcsr_mcause <= "11011";
-				elsif (rcsr_mstatus(0) = '1' and (rcsr_mie(0) and rcsr_mip(0)) = '1') then
-					r_state <= State_Trap;
-					rcsr_mcause <= "10011";
-				else
-					r_state <= State_Decode;
-					bus_act <='1';
-					bus_wnr <= '0';
-					bus_byten <= "1111";
-					bus_addr <= std_logic_vector(r_pc);
-				end if;
-
-			-- DDDD   EEEEE   CCCC
-			-- D   D  E      C
-			-- D   D  EEEEE  C
-			-- D   D  E      C
-			-- DDDD   EEEEE   CCCC
-
-			elsif (r_state = State_Decode and bus_ack = '1') then
-				bus_act <= '0';
-				r_state <= State_Execute;
-				r_rd <= unsigned(bus_rdata(11 downto 7));
-				r_reg1 <= false;
-				r_reg2 <= false;
-				r_funct3 <= va_funct3;
-				r_op1 <= x"00000000";
-				r_op2 <= x"00000000";
-
-				case va_inst62 is
-					when "01101" => -- LUI
-						r_op <= Op_Add;
-						r_op2 <= va_immu;
-					when "00101" => -- AUIPC
-						r_op <= Op_Add;
-						r_op1 <= std_logic_vector(r_pc);
-						r_op2 <= va_immu;
-					when "11011" => -- JAL
-						r_op <= Op_Jump;
-						r_op1 <= std_logic_vector(r_pc);
-						r_op2 <= va_immj;
-					when "11001" => -- JALR
-						r_op <= Op_Jump;
-						r_reg1 <= true;
-						r_op2 <= va_immi;
-						if (va_funct3 /= "000") then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
+				case r_state is
+					when State_FetchWriteback =>
+						if (s_type /= Type_Mem or bus_ack = '1') then
+							r_state <= State_Decode;
 						end if;
-					when "11000" => -- Branch
-						case va_funct3 is
-							when "000" => r_op <= Op_BranchEq;
-							when "001" => r_op <= Op_BranchNe;
-							when "100" => r_op <= Op_BranchLt;
-							when "101" => r_op <= Op_BranchGe;
-							when "110" => r_op <= Op_BranchLtu;
-							when "111" => r_op <= Op_BranchGeu;
-							when others => null;
-						end case;
-						r_reg1 <= true;
-						r_reg2 <= true;
-						r_op3 <= va_immb;
-						r_rd <= "00000";
-						if (va_funct3(2 downto 1) = "01") then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
+					when State_Decode =>
+						if (bus_ack = '1') then
+							r_state <= State_Execute;
+							r_instr <= bus_rdata;
 						end if;
-					when "00000" => -- Load
-						r_op <= Op_Load;
-						r_reg1 <= true;
-						r_op3 <= va_immi;
-						if (va_funct3 = "011" or va_funct3 = "110" or va_funct3 = "111") then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
-						end if;
-					when "01000" => -- Store
-						r_op <= Op_Store;
-						r_rd <= "00000";
-						r_reg1 <= true;
-						r_reg2 <= true;
-						r_op3 <= va_imms;
-						if (va_funct3 = "011" or va_funct3(2) = '1') then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
-						end if;
-					when "00100" => -- OP-IMM
-						case va_funct3 is
-							when "000" => r_op <= Op_Add;
-							when "001" => r_op <= Op_Sll;
-							when "010" => r_op <= Op_Slt;
-							when "011" => r_op <= Op_Sltu;
-							when "100" => r_op <= Op_Xor;
-							when "101" =>
-								if (va_funct7(5) = '1') then
-									r_op <= Op_Sra;
-								else
-									r_op <= Op_Srl;
-								end if;
-							when "110" => r_op <= Op_Or;
-							when "111" => r_op <= Op_And;
-						end case;
-						r_reg1 <= true;
-						r_op2 <= va_immi;
-						if (va_funct3 = "001" and va_funct7 /= "0000000") then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
-						elsif (va_funct3 = "101" and (va_funct7 /= "0000000" and va_funct7 /= "0100000")) then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
-						end if;
-					when "01100" => -- OP
-						if (va_funct7(0) = '1') then -- RV32<M>
-							case va_funct3 is
-								when "000" => r_op <= Op_Mul;
-								when "001" => r_op <= Op_Mulh;
-								when "010" => r_op <= Op_Mulhsu;
-								when "011" => r_op <= Op_Mulhu;
-								when "100" => r_op <= Op_Div;
-								when "101" => r_op <= Op_Divu;
-								when "110" => r_op <= Op_Rem;
-								when "111" => r_op <= Op_Remu;
-							end case;
-						else -- RV32<I>
-							case va_funct3 is
-								when "000" =>
-									if (va_funct7(5) = '1') then
-										r_op <= Op_Sub;
-									else
-										r_op <= Op_Add;
-									end if;
-								when "001" => r_op <= Op_Sll;
-								when "010" => r_op <= Op_Slt;
-								when "011" => r_op <= Op_Sltu;
-								when "100" => r_op <= Op_Xor;
-								when "101" =>
-									if (va_funct7(5) = '1') then
-										r_op <= Op_Sra;
-									else
-										r_op <= Op_Srl;
-									end if;
-								when "110" => r_op <= Op_Or;
-								when "111" => r_op <= Op_And;
-							end case;
-						end if;
-						r_reg1 <= true;
-						r_reg2 <= true;
-						if (not(va_funct7 = "0000000" or (va_funct7 = "0100000" and (va_funct3 = "000" or va_funct3 = "101")) -- RV32I valid
-						or va_funct7 = "0000001")) then
-							r_state <= State_Trap;
-							rcsr_mtval <= bus_rdata;
-							rcsr_mcause <= "00010";
-						end if;
-					when "11100" => -- System
-						if (bus_rdata = x"30200073") then -- MRET
-							r_op <= Op_Mret;
-							r_rd <= "00000";
-						elsif (bus_rdata = x"00000073") then -- ECALL
-							r_state <= State_Trap;
-							rcsr_mcause <= "01000";
-						else
-							r_op1 <= "000000000000000000000000000" & bus_rdata(19 downto 15);
-							if (va_funct3(2) = '0') then
-								r_reg1 <= true;
+					when State_Execute =>
+						if (s_type = Type_AluBrn) then
+							if (not s_aluwait) then
+								r_state <= State_FetchWriteback;
 							end if;
-							case va_funct3(1 downto 0) is
-								when "00" => null;
-								when "01" => r_op <= Op_Csrw;
-								when "10" => r_op <= Op_Csrs;
-								when "11" => r_op <= Op_Csrc;
-							end case;
-							case va_immi(11 downto 0) is
-								when x"c01" =>
-									r_csrval <= rcsr_time(31 downto 0);
-									r_csr <= Csr_Time;
-								when x"c81" =>
-									r_csrval <= rcsr_time(63 downto 32);
-									r_csr <= Csr_Timeh;
-								when x"7c0" =>
-									r_csrval <= rcsr_timecmp(31 downto 0);
-									r_csr <= Csr_Timecmp;
-								when x"7c1" =>
-									r_csrval <= rcsr_timecmp(63 downto 32);
-									r_csr <= Csr_Timecmph;
-								when x"7c2" =>
-									r_csrval <= rcsr_irqen;
-									r_csr <= Csr_Irqen;
-								when x"7c3" =>
-									r_csrval <= rcsr_irqpen;
-									r_csr <= Csr_Irqpen;
-								when x"c02" =>
-									r_csrval <= rcsr_instret(31 downto 0);
-									r_csr <= Csr_Instret;
-								when x"c82" =>
-									r_csrval <= rcsr_instret(63 downto 32);
-									r_csr <= Csr_Instreth;
-								when x"305" =>
-									r_csrval <= rcsr_mtvec;
-									r_csr <= Csr_Mtvec;
-								when x"341" =>
-									r_csrval <= rcsr_mepc;
-									r_csr <= Csr_Mepc;
-								when x"343" =>
-									r_csrval <= rcsr_mtval;
-									r_csr <= Csr_Mtval;
-								when x"304" =>
-									r_csrval <= (others => '0');
-									r_csrval(11) <= rcsr_mie(2);
-									r_csrval(7) <= rcsr_mie(1);
-									r_csrval(3) <= rcsr_mie(0);
-									r_csr <= Csr_Mie;
-								when x"344" =>
-									r_csrval <= (others => '0');
-									r_csrval(11) <= rcsr_mip(2);
-									r_csrval(7) <= rcsr_mip(1);
-									r_csrval(3) <= rcsr_mip(0);
-									r_csr <= Csr_Mip;
-								when x"300" =>
-									r_csrval <= (others => '0');
-									r_csrval(7) <= rcsr_mstatus(1);
-									r_csrval(3) <= rcsr_mstatus(0);
-									r_csr <= Csr_Mstatus;
-								when x"342" =>
-									r_csrval <= (others => '0');
-									r_csrval(3 downto 0) <= rcsr_mcause(3 downto 0);
-									r_csrval(31) <= rcsr_mcause(4);
-									r_csr <= Csr_Mcause;
-								when others =>
-									r_state <= State_Trap;
-									rcsr_mtval <= bus_rdata;
-									rcsr_mcause <= "00010";
-							end case;
+						elsif (s_type = Type_Csr) then
+							r_state <= State_FetchWriteback;
+						elsif (s_type = Type_Mem) then
+							r_state <= State_FetchWriteback;
 						end if;
-					when others =>
-						r_state <= State_Trap;
-						rcsr_mtval <= bus_rdata;
-						rcsr_mcause <= "00010";
 				end case;
-
-				if (bus_rdata(1 downto 0) /= "11") then
-					r_state <= State_Trap;
-					rcsr_mtval <= bus_rdata;
-					rcsr_mcause <= "00010";
-				end if;
-				
-			-- EEEEE  X   X  EEEEE
-			-- E       X X   E
-			-- EEEEE    X    EEEEE
-			-- E       X X   E
-			-- EEEEE  X   X  EEEEE
-
-			elsif (r_state = State_Execute) then
-
-				r_pc <= r_pc + 4;
-				r_state <= State_FetchWriteback;
-				r_res <= (others => '0');
-
-				case r_op is
-					when Op_Jump =>
-						r_pc <= unsigned(c_op1) + unsigned(c_op2);
-						r_res <= std_logic_vector(unsigned(r_pc) + 4);
-					when Op_BranchEq =>
-						if (c_op1 = c_op2) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_BranchNe =>
-						if (c_op1 /= c_op2) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_BranchLt =>
-						if (signed(c_op1) < signed(c_op2)) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_BranchGe =>
-						if (signed(c_op1) >= signed(c_op2)) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_BranchLtu =>
-						if (unsigned(c_op1) < unsigned(c_op2)) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_BranchGeu =>
-						if (unsigned(c_op1) >= unsigned(c_op2)) then
-							r_pc <= r_pc + unsigned(r_op3);
-						end if;
-					when Op_Load =>
-						r_state <= State_Memory;
-						bus_act <= '1';
-						bus_wnr <= '0';
-						bus_addr <= c_memaddr;
-						case r_funct3(1 downto 0) is
-							when "00" => 
-								bus_byten <= "0001";
-							when "01" =>
-								if (c_memaddr(0) /= '0') then
-									r_state <= State_Trap;
-									rcsr_mtval <= c_memaddr;
-									rcsr_mcause <= "00100";
-									bus_act <= '0';
-								end if;
-								bus_byten <= "0011";
-							when "10" =>
-								if (c_memaddr(1 downto 0) /= "00") then
-									r_state <= State_Trap;
-									rcsr_mtval <= c_memaddr;
-									rcsr_mcause <= "00100";
-									bus_act <= '0';
-								end if;
-								bus_byten <= "1111";
-							when others => null;
-						end case;
-						if (c_memaddr = x"00000000") then
-							r_state <= State_Trap;
-							rcsr_mtval <= c_memaddr;
-							rcsr_mcause <= "00101";
-							bus_act <= '0';
-						end if;
-					when Op_Store =>
-						r_state <= State_Memory;
-						bus_act <= '1';
-						bus_wnr <= '1';
-						bus_wdata <= reg_dato2;
-						bus_addr <= c_memaddr;
-						case r_funct3(1 downto 0) is
-							when "00" => 
-								bus_byten <= "0001";
-							when "01" =>
-								if (c_memaddr(0) /= '0') then
-									r_state <= State_Trap;
-									rcsr_mtval <= c_memaddr;
-									rcsr_mcause <= "00110";
-									bus_act <= '0';
-								end if;
-								bus_byten <= "0011";
-							when "10" =>
-								if (c_memaddr(1 downto 0) /= "00") then
-									r_state <= State_Trap;
-									rcsr_mtval <= c_memaddr;
-									rcsr_mcause <= "00110";
-									bus_act <= '0';
-								end if;
-								bus_byten <= "1111";
-							when others => null;
-						end case;
-						if (c_memaddr = x"00000000") then
-							r_state <= State_Trap;
-							rcsr_mtval <= c_memaddr;
-							rcsr_mcause <= "00111";
-							bus_act <= '0';
-						end if;
-					when Op_Add =>
-						r_res <= std_logic_vector(unsigned(c_op1) + unsigned(c_op2));
-					when Op_Slt =>
-						if (signed(c_op1) < signed(c_op2)) then
-							r_res <= x"00000001";
-						else
-							r_res <= x"00000000";
-						end if;
-					when Op_Sltu =>
-						if (unsigned(c_op1) < unsigned(c_op2)) then
-							r_res <= x"00000001";
-						else
-							r_res <= x"00000000";
-						end if;
-					when Op_Xor =>
-						r_res <= c_op1 xor c_op2;
-					when Op_Or =>
-						r_res <= c_op1 or c_op2;
-					when Op_And =>
-						r_res <= c_op1 and c_op2;
-					when Op_Sll =>
-						r_res <= std_logic_vector(shift_left(unsigned(c_op1), to_integer(unsigned(c_op2(4 downto 0)))));
-					when Op_Srl =>
-						r_res <= std_logic_vector(shift_right(unsigned(c_op1), to_integer(unsigned(c_op2(4 downto 0)))));
-					when Op_Sra =>
-						r_res <= std_logic_vector(shift_right(signed(c_op1), to_integer(unsigned(c_op2(4 downto 0)))));
-					when Op_Sub =>
-						r_res <= std_logic_vector(unsigned(c_op1) - unsigned(c_op2));
-					when Op_Mul | Op_Mulh | Op_Mulhsu | Op_Mulhu =>
-						if (r_multi) then
-							r_multi <= false;
-							case r_op is
-								when Op_Mul => r_res <= r_mulss(31 downto 0);
-								when Op_Mulh => r_res <= r_mulss(63 downto 32);
-								when Op_Mulhsu => r_res <= r_mulsu(63 downto 32);
-								when Op_Mulhu => r_res <= r_muluu(63 downto 32);
-								when others => null;
-							end case;
-						else
-							r_mulss <= std_logic_vector(signed(reg_dato1) * signed(reg_dato2));
-							r_mulsu <= std_logic_vector(signed(reg_dato1(31) & reg_dato1) * signed('0' & reg_dato2));
-							r_muluu <= std_logic_vector(unsigned(reg_dato1) * unsigned(reg_dato2));
-							r_multi <= true;
-							r_pc <= r_pc;
-							r_state <= State_Execute;
-						end if;
-					when Op_Div | Op_Divu | Op_Rem | Op_Remu =>
-						if (r_multi and div_done) then
-							r_multi <= false;
-							r_res <= div_result;
-						elsif (r_multi and not div_done) then
-							r_state <= State_Execute;
-							r_pc <= r_pc;
-						else 
-							r_state <= State_Execute;
-							r_pc <= r_pc;
-							r_multi <= true;
-						end if;
-					when Op_Mret =>
-						r_pc <= unsigned(rcsr_mepc);
-						rcsr_mstatus(0) <= rcsr_mstatus(1);
-					when Op_Csrw =>
-						r_res <= r_csrval;
-						r_csrres <= c_op1;
-						r_csrpen <= true;
-					when Op_Csrs =>
-						r_res <= r_csrval;
-						r_csrres <= c_op1 or r_csrval;
-						if (c_op1 /= x"00000000") then
-							r_csrpen <= true;
-						end if;
-					when Op_Csrc =>
-						r_res <= r_csrval;
-						r_csrres <= not c_op1 and r_csrval;
-						if (c_op1 /= x"00000000") then
-							r_csrpen <= true;
-						end if;
-					end case;
-
-			-- M   M  EEEEE  M   M
-			-- MM MM  E      MM MM
-			-- M M M  EEEEE  M M M
-			-- M   M  E      M   M
-			-- M   M  EEEEE  M   M
-
-			elsif (r_state = State_Memory and bus_ack = '1') then
-				r_state <= State_FetchWriteback;
-				bus_act <= '0';
-				if (r_op = Op_Load) then
-					case r_funct3 is
-						when "000" =>
-							r_res <= (others => bus_rdata(7));
-							r_res(7 downto 0) <= bus_rdata(7 downto 0);
-						when "001" =>
-							r_res <= (others => bus_rdata(15));
-							r_res(15 downto 0) <= bus_rdata(15 downto 0);
-						when "010" => r_res <= bus_rdata;
-						when "100" => r_res <= x"000000" & bus_rdata(7 downto 0);
-						when "101" => r_res <= x"0000" & bus_rdata(15 downto 0);
-						when others => null;
-					end case;
-				end if;
-			
-			elsif (r_state = State_Trap) then
-				r_state <= State_FetchWriteback;
-				r_rd <= "00000";
-				r_pc <= unsigned(rcsr_mtvec);
-				rcsr_mepc <= std_logic_vector(r_pc);
-				rcsr_mstatus(1) <= rcsr_mstatus(0);
-				rcsr_mstatus(0) <= '0';
 			end if;
-
 		end if;
 	end process;
+	-- TODO: there are exactly 2 entites the core should modify (side effects):
+	-- 1. register
+	-- 2. memory
+	-- When a trap occures, the instruction shall not be executed,
+	-- therefore stop bus_act here (and write in registers!)
+	bus_act   <= '1' when r_state = State_Decode or c_memact else '0';
+	bus_addr  <= c_busaddr;
+	bus_wnr   <= s_mem_wnr when c_memact else '0';
+	bus_byten <= s_mem_byten when c_memact else "1111"; -- even though for read access byten may be ignored
+	bus_wdata <= s_mem_wdata;
 
-	c_op1 <= reg_dato1 when r_reg1 else r_op1;
-	c_op2 <= reg_dato2 when r_reg2 else r_op2;
-	c_memaddr <= std_logic_vector(unsigned(reg_dato1) + unsigned(r_op3));
-
-	reg_dati1 <= r_res;
-	reg_addr1 <= r_rd when reg_wren1 = '1' else unsigned(bus_rdata(19 downto 15));
-	reg_addr2 <= unsigned(bus_rdata(24 downto 20));
-
-	div_start <= 
-		(r_op = Op_Div or
-		r_op = Op_Divu or
-		r_op = Op_Rem or
-		r_op = Op_Remu) and
-		r_multi = false and
-		r_state = State_Execute;
+	c_busaddr <= s_mem_addr when c_memact else s_pc;
+	c_memact <= r_state = State_FetchWriteback and s_type = Type_Mem;
+	c_fchactive <= r_state = State_FetchWriteback and (c_memact = (bus_ack = '1'));
+	c_decactive <= r_state = State_Decode and bus_ack = '1';
+	c_exeactive <= r_state = State_Execute;
+	c_res <=
+		s_csrres when s_type = Type_Csr else
+		s_memres when s_type = Type_Mem else
+		s_alures;
+	c_regwrite <= r_state = State_FetchWriteback and (s_type /= Type_Mem or bus_ack = '1') and not c_trap;
+	c_trap <= s_trp_badinstr or s_trp_ecall or
+		s_trp_loadaccess or s_trp_loadalign or s_trp_storeacess or s_trp_storealign or
+		s_trp_instaccess or s_trp_instalign or
+		s_trp_irqext or s_trp_irqsoft or s_trp_irqtimer;
 
 end architecture;
